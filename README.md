@@ -4,9 +4,10 @@ Hermes Agent is a fully autonomous TypeScript research agent that discovers rece
 
 ## What Hermes does
 
-- Scrapes YC directory companies plus supporting signals from Launch HN, Nitter, and Product Hunt
-- Normalizes unstructured candidate data with DeepSeek V3
-- Enriches founders with LinkedIn, Twitter, and Hunter.io email lookup data
+- Scrapes YC plus public accelerator, VC, portfolio, and cohort pages before using paid parsing
+- Covers YC, Techstars, 500 Global, Sequoia Arc, a16z, Antler, EF, Plug and Play, Alchemist, Neo, Pear VC, HAX, On Deck, Google for Startups, Microsoft for Startups, NVIDIA Inception, Lightspeed, Benchmark, General Catalyst, Founders Fund, Greylock, Accel, and Index Ventures
+- Normalizes unstructured Launch HN, Nitter, and Product Hunt candidates with DeepSeek V3 only after deterministic tech filters pass
+- Enriches founders with LinkedIn, X/Twitter, careers/apply URLs, and engineering hiring signals when discoverable
 - Stores deduplicated founder records in SQLite
 - Sends each founder as an individual Telegram message
 - Runs on a schedule and stops automatically after the configured runtime window
@@ -17,7 +18,6 @@ Hermes Agent is a fully autonomous TypeScript research agent that discovers rece
 - pnpm
 - A Telegram account
 - DeepSeek API access
-- Hunter.io API access
 
 ## Setup
 
@@ -32,30 +32,27 @@ Hermes Agent is a fully autonomous TypeScript research agent that discovers rece
    `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
    Find the `chat` object in the JSON response and copy its `id` into `TELEGRAM_CHAT_ID`.
 
-4. Get a Hunter.io API key.
-   Sign in at [hunter.io](https://hunter.io), open the API dashboard, and copy the key into `HUNTER_API_KEY`.
-
-5. Install dependencies.
+4. Install dependencies.
 
    ```bash
    pnpm install
    ```
 
-6. Install Playwright Chromium.
+5. Install Playwright Chromium.
 
    ```bash
    npx playwright install chromium
    ```
 
-7. Create your environment file.
+6. Create your environment file.
 
    ```bash
-   cp .env.example .env
+   touch .env
    ```
 
-   Fill in all values before running the agent.
+   Fill in all required values before running the agent.
 
-8. Start Hermes Agent.
+7. Start Hermes Agent.
 
    ```bash
    pnpm start
@@ -64,10 +61,15 @@ Hermes Agent is a fully autonomous TypeScript research agent that discovers rece
 ## Runtime behavior
 
 - Hermes runs immediately on startup and then follows the configured schedule.
-- Founder records are stored in `data/hermes.sqlite`.
+- Founder records are stored in `data/hermes.db`.
 - Logs are written to `logs/hermes-agent.log` and `logs/hermes-error.log`.
 - If Telegram delivery fails, founders remain unsent in SQLite and are retried on later runs.
 - The runtime window persists across process restarts until Hermes completes its configured max runtime.
+- Leads must be tech/product related, recent as of February 25, 2026 or from a current 2026 cohort, and have a founder LinkedIn or X/Twitter profile before they are sent.
+- Set `DRY_RUN=true` to scrape up to 3 structured leads, enrich them, send exactly one founder message, print spend, and exit without starting cron.
+- Dry runs are zero-credit by default: `DRY_RUN_USE_LLM=false` skips the DeepSeek startup ping and skips raw social/news parsing.
+- Set `DRY_RUN_USE_LLM=true` only when you want a paid smoke test of raw candidate parsing.
+- Use `LLM_PARSE_MAX_PER_RUN` to cap paid raw-candidate parsing attempts per scheduled run. The default is `0`, so paid raw parsing is opt-in.
 
 ## Development
 
@@ -87,4 +89,16 @@ Run type-checking:
 
 ```bash
 pnpm typecheck
+```
+
+Inspect recent founders:
+
+```bash
+pnpm check
+```
+
+Inspect API spend:
+
+```bash
+pnpm spend
 ```

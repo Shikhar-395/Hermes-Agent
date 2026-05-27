@@ -1,30 +1,75 @@
 import axios from "axios";
-import { load } from "cheerio";
+import { load, type CheerioAPI } from "cheerio";
 
 import {
   fetchHtmlWithBrowser,
   launchStealthBrowser,
 } from "./browser-utils.js";
+import { config } from "./config.js";
+import { detectTechCategory, prepareFounderLead } from "./lead-utils.js";
 import { logger } from "./logger.js";
-import type { Founder, RawCandidate, ScrapeOptions } from "./types.js";
+import {
+  getSourceLabel,
+  PUBLIC_PAGE_SOURCES,
+  type FounderSourceDefinition,
+} from "./sources.js";
+import type {
+  Founder,
+  RawCandidate,
+  ScrapeOptions,
+  ScraperSource,
+} from "./types.js";
 
-const YC_BATCH_URLS = [
-  "https://www.ycombinator.com/companies?batch=S25",
-  "https://www.ycombinator.com/companies?batch=W25",
-  "https://www.ycombinator.com/companies?batch=S26",
-  "https://www.ycombinator.com/companies?batch=W26",
-];
+const YC_ALGOLIA_URL =
+  "https://45BWZJ1SGC-dsn.algolia.net/1/indexes/YCCompany_production/query";
+const YC_ALGOLIA_HEADERS = {
+  "X-Algolia-Application-Id": "45BWZJ1SGC",
+  "X-Algolia-API-Key":
+    "NzllNTY5MzJiZGM2OTY2ZTQwMDEzOTNhYWZiZGRjODlhYzVkNjBmOGRjNzJiMWM4ZTU0ZDlhYTZjOTJiMjlhMWFuYWx5dGljc1RhZ3M9eWNkYyZyZXN0cmljdEluZGljZXM9WUNDb21wYW55X3Byb2R1Y3Rpb24lMkNZQ0NvbXBhbnlfQnlfTGF1bmNoX0RhdGVfcHJvZHVjdGlvbiZ0YWdGaWx0ZXJzPSU1QiUyMnljZGNfcHVibGljJTIyJTVE",
+};
+const YC_ALGOLIA_BODY = {
+  filters: 'batch:"Spring 2026" OR batch:"Winter 2026"',
+  hitsPerPage: 50,
+};
 
-const NITTER_BASE_URL = "https://nitter.poast.org";
 const NITTER_QUERIES = [
   "just got into YC",
   "we are in YC S25",
   "YC W25 batch",
   "accepted into Y Combinator",
+  "accepted into Techstars",
+  "joining Techstars",
+  "joined Techstars",
+  "Techstars batch",
+  "accepted into Antler",
+  "joined Antler Residency",
+  "Antler portfolio company",
+  "joined Seedcamp",
+  "backed by Seedcamp",
+  "a16z speedrun",
+  "joined a16z speedrun",
+  "got into HF0",
+  "joined HF0",
+  "Neo accelerator",
+  "joined Neo Residency",
+  "South Park Commons founder fellowship",
+  "SPC founder fellowship",
 ];
+
+const STARTUPWHO_BASE_URL = "https://www.startupwho.com/startups";
+
+export type StartupWhoAcceleratorSource = FounderSourceDefinition & {
+  startupWhoSlug?: string;
+  slug?: string;
+};
 
 function cleanText(value: string | null | undefined): string {
   return (value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function summarizeError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.split("\n")[0]?.trim() || message;
 }
 
 function toAbsoluteUrl(href: string, baseUrl: string): string | null {
@@ -62,6 +107,23 @@ function isExternalWebsite(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isLinkedInProfileUrl(url: string): boolean {
+  return /linkedin\.com\/in\//i.test(url);
+}
+
+function isTwitterProfileUrl(url: string): boolean {
+  return /(twitter|x)\.com\/(?!share|home|search|intent|i\/|hashtag|explore)/i.test(
+    url,
+  );
+}
+
+function firstMatchingUrl(
+  urls: Array<string | null | undefined>,
+  predicate: (url: string) => boolean,
+): string | null {
+  return urls.find((url): url is string => Boolean(url && predicate(url))) ?? null;
 }
 
 function looksLikePersonName(value: string): boolean {
@@ -238,6 +300,54 @@ function extractFounderNamesFromText(text: string): string[] {
   return uniqueStrings(candidates);
 }
 
+function extractFounderNamesFromLeadershipText(text: string): string[] {
+  const candidates: string[] = [];
+  const leadershipMatches = text.matchAll(
+    /([A-Z][A-Za-z'’-]+(?:\s+[A-Z][A-Za-z'’-]+){1,3})\s*(?:,|-|–|\s+)\s*(?:co-?founder|founder|ceo|cto|chief executive|chief technology)/gi,
+  );
+
+  for (const match of leadershipMatches) {
+    if (match[1] && looksLikePersonName(match[1])) {
+      candidates.push(match[1]);
+    }
+  }
+
+  const foundedByMatch = text.match(/\bfounded by\s+(.+?)(?:\.|,|\n|$)/i);
+  if (foundedByMatch?.[1]) {
+    candidates.push(...extractFounderNamesFromText(foundedByMatch[1]));
+  }
+
+  return uniqueStrings(candidates);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractFounderNamesFromYcMetaDescription(
+  description: string,
+  companyName: string,
+): string[] {
+  if (!description) {
+    return [];
+  }
+
+  const companySpecificMatch = description.match(
+    new RegExp(
+      `\\bFounded in \\d{4} by (.+?),\\s+${escapeRegExp(companyName)}\\s+has\\b`,
+      "i",
+    ),
+  );
+  const fallbackMatch = description.match(
+    /\bFounded in \d{4} by (.+?)(?:,\s+[^,]+ has\b|$)/i,
+  );
+  const founderText = cleanText(
+    companySpecificMatch?.[1] ?? fallbackMatch?.[1] ?? "",
+  );
+
+  return founderText ? extractFounderNamesFromText(founderText) : [];
+}
+
 function extractExternalWebsiteFromHtml(html: string, baseUrl: string): string | null {
   const $ = load(html);
   const candidates: string[] = [];
@@ -348,6 +458,7 @@ export function extractYcFounderDetailsFromHtml(
 ): Founder[] {
   const $ = load(html);
   const payloads = parseJsonScripts(html);
+  const metaDescription = cleanText($('meta[name="description"]').attr("content"));
   const companyName =
     fallback.companyName ||
     cleanText($("h1").first().text()) ||
@@ -356,7 +467,7 @@ export function extractYcFounderDetailsFromHtml(
   const companyDescription =
     fallback.companyDescription ||
     findFirstStringByKeys(payloads, ["oneLiner", "tagline", "description"]) ||
-    cleanText($('meta[name="description"]').attr("content")) ||
+    metaDescription ||
     cleanText($("p").first().text()) ||
     null;
   const website =
@@ -364,10 +475,14 @@ export function extractYcFounderDetailsFromHtml(
     findFirstStringByKeys(payloads, ["website", "websiteUrl"]) ||
     extractExternalWebsiteFromHtml(html, detailUrl);
 
-  const founderNames = uniqueStrings([
+  const structuredFounderNames = uniqueStrings([
     ...extractFounderNamesFromJson(payloads),
-    ...extractFounderNamesFromText($.root().text()),
+    ...extractFounderNamesFromYcMetaDescription(metaDescription, companyName),
   ]);
+  const founderNames =
+    structuredFounderNames.length > 0
+      ? structuredFounderNames
+      : extractFounderNamesFromText($.root().text());
 
   return founderNames.map((founderName) => ({
     founderName,
@@ -379,6 +494,13 @@ export function extractYcFounderDetailsFromHtml(
     email: null,
     website,
     ycProfileUrl: detailUrl,
+    sourceProfileUrl: detailUrl,
+    fundingSource: "Y Combinator",
+    fundingDate: null,
+    fundingRound: batch,
+    techCategory: detectTechCategory(companyDescription),
+    careersUrl: null,
+    engineeringHiringSignal: false,
     batch,
     source: "yc_directory",
     sentAt: null,
@@ -386,11 +508,236 @@ export function extractYcFounderDetailsFromHtml(
   }));
 }
 
+type UnknownRecord = Record<string, unknown>;
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function stringField(record: UnknownRecord, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string") {
+      const cleaned = cleanText(value);
+      if (cleaned) {
+        return cleaned;
+      }
+    }
+  }
+
+  return null;
+}
+
+function normalizeApiUrl(value: string | null, baseUrl?: string): string | null {
+  const cleaned = cleanText(value);
+
+  if (!cleaned) {
+    return null;
+  }
+
+  if (/^https?:\/\//i.test(cleaned)) {
+    return cleaned;
+  }
+
+  if (cleaned.startsWith("/") && baseUrl) {
+    return toAbsoluteUrl(cleaned, baseUrl);
+  }
+
+  if (/^[a-z0-9.-]+\.[a-z]{2,}(?:\/.*)?$/i.test(cleaned)) {
+    return `https://${cleaned}`;
+  }
+
+  return null;
+}
+
+function extractYcAlgoliaHits(payload: unknown): UnknownRecord[] {
+  if (!isRecord(payload) || !Array.isArray(payload.hits)) {
+    return [];
+  }
+
+  return payload.hits.filter(isRecord);
+}
+
+function extractYcFounderNames(value: unknown): string[] {
+  const names: string[] = [];
+
+  if (typeof value === "string") {
+    names.push(...extractFounderNamesFromText(value));
+  } else if (Array.isArray(value)) {
+    for (const founder of value) {
+      if (typeof founder === "string") {
+        names.push(cleanText(founder));
+        continue;
+      }
+
+      if (!isRecord(founder)) {
+        continue;
+      }
+
+      const fullName = stringField(founder, [
+        "name",
+        "full_name",
+        "fullName",
+        "founder_name",
+        "founderName",
+      ]);
+      if (fullName) {
+        names.push(fullName);
+        continue;
+      }
+
+      const firstName = stringField(founder, ["first_name", "firstName"]);
+      const lastName = stringField(founder, ["last_name", "lastName"]);
+      if (firstName && lastName) {
+        names.push(`${firstName} ${lastName}`);
+      }
+    }
+  }
+
+  return uniqueStrings(names);
+}
+
+function buildYcCompanyDescription(
+  oneLiner: string | null,
+  longDescription: string | null,
+): string | null {
+  if (oneLiner && longDescription && oneLiner !== longDescription) {
+    return `${oneLiner}\n\n${longDescription}`;
+  }
+
+  return oneLiner ?? longDescription;
+}
+
+function buildYcProfileUrl(hit: UnknownRecord): string | null {
+  const directUrl = normalizeApiUrl(
+    stringField(hit, ["url", "yc_url", "ycUrl"]),
+    "https://www.ycombinator.com",
+  );
+
+  if (directUrl) {
+    return directUrl;
+  }
+
+  const slug = stringField(hit, ["slug"]);
+  return slug ? `https://www.ycombinator.com/companies/${slug}` : null;
+}
+
+export function extractYcCompaniesFromAlgoliaPayload(
+  payload: unknown,
+): YcCompanyCard[] {
+  const companies: YcCompanyCard[] = [];
+
+  for (const hit of extractYcAlgoliaHits(payload)) {
+    const companyName = stringField(hit, ["name"]);
+    const ycProfileUrl = buildYcProfileUrl(hit);
+
+    if (!companyName || !ycProfileUrl) {
+      continue;
+    }
+
+    const oneLiner = stringField(hit, ["one_liner", "oneLiner"]);
+    const longDescription = stringField(hit, [
+      "long_description",
+      "longDescription",
+    ]);
+
+    companies.push({
+      companyName,
+      companyDescription: buildYcCompanyDescription(oneLiner, longDescription),
+      ycProfileUrl,
+      website: normalizeApiUrl(stringField(hit, ["website"])),
+      batch: stringField(hit, ["batch"]),
+    });
+  }
+
+  return companies;
+}
+
+export function extractYcFoundersFromAlgoliaPayload(payload: unknown): Founder[] {
+  const founders: Founder[] = [];
+
+  for (const hit of extractYcAlgoliaHits(payload)) {
+    const companyName = stringField(hit, ["name"]);
+    if (!companyName) {
+      continue;
+    }
+
+    const oneLiner = stringField(hit, ["one_liner", "oneLiner"]);
+    const longDescription = stringField(hit, [
+      "long_description",
+      "longDescription",
+    ]);
+    const companyDescription = buildYcCompanyDescription(
+      oneLiner,
+      longDescription,
+    );
+    const website = normalizeApiUrl(stringField(hit, ["website"]));
+    const ycProfileUrl = buildYcProfileUrl(hit);
+    const batch = stringField(hit, ["batch"]);
+    const founderNames = extractYcFounderNames(hit.founders);
+
+    for (const founderName of founderNames) {
+      founders.push({
+        founderName,
+        companyName,
+        companyDescription,
+        linkedinUrl: null,
+        twitterUrl: null,
+        twitterHandle: null,
+        email: null,
+        website,
+        ycProfileUrl,
+        sourceProfileUrl: ycProfileUrl,
+        fundingSource: "Y Combinator",
+        fundingDate: null,
+        fundingRound: batch,
+        techCategory: detectTechCategory(companyDescription),
+        careersUrl: null,
+        engineeringHiringSignal: false,
+        batch,
+        source: "yc_directory",
+        sentAt: null,
+        createdAt: new Date().toISOString(),
+      });
+    }
+  }
+
+  return founders;
+}
+
+async function fetchYcCompanyFoundersFromDetailPage(
+  company: YcCompanyCard,
+): Promise<Founder[]> {
+  try {
+    const response = await axios.get<string>(company.ycProfileUrl, {
+      timeout: 20_000,
+      headers: {
+        Accept: "text/html",
+      },
+    });
+
+    return extractYcFounderDetailsFromHtml(
+      response.data,
+      company.ycProfileUrl,
+      company.batch,
+      company,
+    );
+  } catch (error) {
+    logger.warn(
+      `YC company detail fetch failed for ${company.ycProfileUrl}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return [];
+  }
+}
+
 interface HnHit {
   title?: string | null;
   url?: string | null;
   author?: string | null;
   story_text?: string | null;
+  created_at?: string | null;
 }
 
 export function filterHnLaunchHits(
@@ -413,6 +760,13 @@ export function filterHnLaunchHits(
         companyDescription: null,
         website: hit.url ?? null,
         ycProfileUrl: null,
+        sourceProfileUrl: hit.url ?? null,
+        fundingSource: "Launch HN",
+        fundingDate: hit.created_at ?? null,
+        fundingRound: "Launch",
+        techCategory: detectTechCategory([title, hit.story_text].filter(Boolean).join("\n")),
+        careersUrl: null,
+        engineeringHiringSignal: false,
         twitterHandle: null,
         batch: null,
       } satisfies RawCandidate;
@@ -457,6 +811,13 @@ export function extractNitterCandidatesFromHtml(
       companyDescription: null,
       website: null,
       ycProfileUrl: null,
+      sourceProfileUrl: null,
+      fundingSource: "Twitter",
+      fundingDate: new Date().toISOString(),
+      fundingRound: null,
+      techCategory: detectTechCategory(tweetText),
+      careersUrl: null,
+      engineeringHiringSignal: false,
       twitterHandle: handle,
       batch: null,
     });
@@ -557,6 +918,13 @@ export function extractProductHuntCandidatesFromHtml(
       companyDescription: tagline || null,
       website: productUrl,
       ycProfileUrl: null,
+      sourceProfileUrl: productUrl,
+      fundingSource: "Product Hunt",
+      fundingDate: referenceDate.toISOString(),
+      fundingRound: "Launch",
+      techCategory: detectTechCategory(`${productName}\n${tagline}`),
+      careersUrl: null,
+      engineeringHiringSignal: false,
       twitterHandle: null,
       batch: null,
     });
@@ -565,52 +933,305 @@ export function extractProductHuntCandidatesFromHtml(
   return results;
 }
 
-export async function scrapeYcDirectory(
-  options: ScrapeOptions = {},
-): Promise<Founder[]> {
-  const visitedUrls = options.visitedUrls ?? new Set<string>();
-  const maxFounders = options.maxResults ?? 20;
-  const maxCompanyPages = Math.max(8, Math.ceil(maxFounders / 2));
+function buildStartupWhoUrl(slug: string, page = 1): string {
+  const url = new URL(STARTUPWHO_BASE_URL);
+  url.searchParams.set("source", slug);
+
+  if (page > 1) {
+    url.searchParams.set("page", String(page));
+  }
+
+  return url.toString();
+}
+
+function getStartupWhoSlug(source: StartupWhoAcceleratorSource): string {
+  return source.startupWhoSlug ?? source.slug ?? source.source;
+}
+
+function buildAcceleratorDescription(
+  accelerator: StartupWhoAcceleratorSource,
+  industry: string | null,
+  location: string | null,
+): string | null {
+  const parts = [
+    `Accelerator: ${accelerator.label}`,
+    industry ? `Industry: ${industry}` : null,
+    location ? `Location: ${location}` : null,
+  ].filter(Boolean);
+
+  return parts.length > 0 ? parts.join("\n") : null;
+}
+
+export function extractStartupWhoAcceleratorFoundersFromHtml(
+  html: string,
+  accelerator: StartupWhoAcceleratorSource,
+): Founder[] {
+  const $ = load(html);
   const founders: Founder[] = [];
-  const browser = await launchStealthBrowser();
+  const seen = new Set<string>();
 
-  try {
-    for (const batchUrl of YC_BATCH_URLS) {
-      const listingPage = await fetchHtmlWithBrowser(browser, batchUrl, {
-        visitedUrls,
-      });
+  $("tbody tr").each((_index, element) => {
+    const cells = $(element).find("td");
+    if (cells.length < 4) {
+      return;
+    }
 
-      if (!listingPage) {
+    const companyName =
+      cleanText(cells.eq(0).find(".font-medium").first().text()) ||
+      cleanText(cells.eq(0).find("span").first().text());
+    const industry = cleanText(cells.eq(1).text()) || null;
+    const location = cleanText(cells.eq(2).text()) || null;
+    const founderText = cleanText(cells.eq(3).text()).replace(/^[—-]+$/, "");
+    const website =
+      normalizeApiUrl(cells.eq(4).find("a[href]").first().attr("href") ?? null) ??
+      null;
+    const rowUrls = cells
+      .find("a[href]")
+      .toArray()
+      .map((node) => normalizeApiUrl($(node).attr("href") ?? null))
+      .filter((url): url is string => Boolean(url));
+    const sourceProfileUrl =
+      rowUrls.find((url) => url.includes("startupwho.com")) ??
+      buildStartupWhoUrl(getStartupWhoSlug(accelerator));
+    const linkedinUrl = firstMatchingUrl(rowUrls, isLinkedInProfileUrl);
+    const twitterUrl = firstMatchingUrl(rowUrls, isTwitterProfileUrl);
+    const fundingDate = cleanText(cells.eq(5).text()) || null;
+
+    if (!companyName || !founderText) {
+      return;
+    }
+
+    const companyDescription = buildAcceleratorDescription(
+      accelerator,
+      industry,
+      location,
+    );
+
+    for (const founderName of extractFounderNamesFromText(founderText)) {
+      const key = `${accelerator.source}|${companyName}|${founderName}`;
+      if (seen.has(key)) {
         continue;
       }
 
-      const cards = extractYcCompanyCardsFromHtml(listingPage.html, batchUrl).slice(
-        0,
-        maxCompanyPages,
-      );
+      seen.add(key);
+      founders.push({
+        founderName,
+        companyName,
+        companyDescription,
+        linkedinUrl,
+        twitterUrl,
+        twitterHandle: null,
+        email: null,
+        website,
+        sourceProfileUrl,
+        fundingSource: accelerator.label,
+        fundingDate,
+        fundingRound: "StartupWho listing",
+        techCategory: detectTechCategory(companyDescription),
+        careersUrl: null,
+        engineeringHiringSignal: false,
+        ycProfileUrl: null,
+        batch: null,
+        source: accelerator.source,
+        sentAt: null,
+        createdAt: new Date().toISOString(),
+      });
+    }
+  });
 
-      for (const card of cards) {
-        if (founders.length >= maxFounders) {
-          break;
+  return founders;
+}
+
+function extractPublishedDateFromHtml(html: string): string | null {
+  const $ = load(html);
+  const candidates = [
+    $('meta[property="article:published_time"]').attr("content"),
+    $('meta[name="date"]').attr("content"),
+    $("time[datetime]").first().attr("datetime"),
+    $("time").first().text(),
+  ];
+
+  for (const candidate of candidates) {
+    const cleaned = cleanText(candidate);
+    if (!cleaned) {
+      continue;
+    }
+
+    const parsed = new Date(cleaned);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+
+  return null;
+}
+
+function extractBatchOrRound(text: string): string | null {
+  const batch = text.match(/\b(Spring|Summer|Fall|Autumn|Winter)\s+2026\b/i)?.[0];
+  if (batch) {
+    return batch;
+  }
+
+  const shorthand = text.match(/\b[SWF]26\b/i)?.[0];
+  if (shorthand) {
+    return shorthand.toUpperCase();
+  }
+
+  const round = text.match(
+    /\b(pre-seed|seed|series\s+[a-c]|accelerator|cohort|arc|inception|speedrun)\b/i,
+  )?.[0];
+  return round ?? null;
+}
+
+type CheerioSelectable = Parameters<CheerioAPI>[0];
+
+function collectOfficialContainers($: CheerioAPI): CheerioSelectable[] {
+  const selectors = [
+    "article",
+    "li",
+    '[class*="card"]',
+    '[class*="company"]',
+    '[class*="portfolio"]',
+    '[class*="startup"]',
+    '[class*="cohort"]',
+  ].join(",");
+
+  const containers = $(selectors)
+    .toArray()
+    .filter((element) => {
+      const text = cleanText($(element).text());
+      return text.length >= 20 && text.length <= 2_500;
+    }) as CheerioSelectable[];
+
+  if (containers.length > 0) {
+    return containers;
+  }
+
+  return $("section, main > div, body > div")
+    .toArray()
+    .filter((element) => {
+      const text = cleanText($(element).text());
+      return text.length >= 20 && text.length <= 2_500;
+    }) as CheerioSelectable[];
+}
+
+export function extractOfficialPortfolioFoundersFromHtml(
+  html: string,
+  source: FounderSourceDefinition,
+  pageUrl: string,
+): Founder[] {
+  const $ = load(html);
+  const founders: Founder[] = [];
+  const seen = new Set<string>();
+  const pageFundingDate = extractPublishedDateFromHtml(html);
+  const pageText = cleanText($.root().text());
+
+  for (const element of collectOfficialContainers($)) {
+    const container = $(element);
+    const text = cleanText(container.text());
+    const companyName =
+      cleanText(container.find("h1, h2, h3, h4").first().text()) ||
+      cleanText(container.find("a[href]").first().text());
+
+    if (!companyName || looksLikePersonName(companyName)) {
+      continue;
+    }
+
+    const description =
+      cleanText(container.find("p").first().text()) ||
+      text.slice(0, 500) ||
+      null;
+    const urls = container
+      .find("a[href]")
+      .toArray()
+      .map((node) => toAbsoluteUrl($(node).attr("href") ?? "", pageUrl))
+      .filter((url): url is string => Boolean(url));
+    const website =
+      urls.find((url) => isExternalWebsite(url) && !isLinkedInProfileUrl(url) && !isTwitterProfileUrl(url)) ??
+      null;
+    const sourceProfileUrl =
+      urls.find((url) => {
+        try {
+          const parsed = new URL(url);
+          const pageHost = new URL(pageUrl).hostname;
+          return parsed.hostname === pageHost && parsed.toString() !== pageUrl;
+        } catch {
+          return false;
         }
+      }) ?? pageUrl;
+    const linkedinUrl = firstMatchingUrl(urls, isLinkedInProfileUrl);
+    const twitterUrl = firstMatchingUrl(urls, isTwitterProfileUrl);
+    const founderNames = extractFounderNamesFromLeadershipText(text);
+    const fundingRound = extractBatchOrRound(text) ?? extractBatchOrRound(pageText);
+    const techCategory = detectTechCategory(`${description ?? ""}\n${text}`);
 
-        const detailPage = await fetchHtmlWithBrowser(browser, card.ycProfileUrl, {
-          visitedUrls,
-        });
-
-        if (!detailPage) {
-          continue;
-        }
-
-        founders.push(
-          ...extractYcFounderDetailsFromHtml(
-            detailPage.html,
-            card.ycProfileUrl,
-            card.batch,
-            card,
-          ),
-        );
+    for (const founderName of founderNames) {
+      const key = `${source.source}|${companyName}|${founderName}`;
+      if (seen.has(key)) {
+        continue;
       }
+
+      seen.add(key);
+      founders.push(
+        prepareFounderLead({
+          founderName,
+          companyName,
+          companyDescription: description,
+          linkedinUrl,
+          twitterUrl,
+          twitterHandle: null,
+          email: null,
+          website,
+          ycProfileUrl: null,
+          sourceProfileUrl,
+          fundingSource: source.label,
+          fundingDate: pageFundingDate,
+          fundingRound,
+          techCategory,
+          careersUrl: null,
+          engineeringHiringSignal: false,
+          batch: fundingRound,
+          source: source.source,
+          sentAt: null,
+          createdAt: new Date().toISOString(),
+        }),
+      );
+    }
+  }
+
+  return founders;
+}
+
+export async function scrapeYcDirectory(
+  options: ScrapeOptions = {},
+): Promise<Founder[]> {
+  const maxFounders = options.maxResults ?? 20;
+
+  try {
+    const response = await axios.post<unknown>(
+      YC_ALGOLIA_URL,
+      YC_ALGOLIA_BODY,
+      {
+        headers: YC_ALGOLIA_HEADERS,
+        timeout: 20_000,
+      },
+    );
+    const founders = extractYcFoundersFromAlgoliaPayload(response.data).slice(
+      0,
+      maxFounders,
+    );
+
+    if (founders.length > 0) {
+      logger.info(`YC directory scrape complete with ${founders.length} founders`);
+      return founders;
+    }
+
+    for (const company of extractYcCompaniesFromAlgoliaPayload(response.data)) {
+      if (founders.length >= maxFounders) {
+        break;
+      }
+
+      founders.push(...(await fetchYcCompanyFoundersFromDetailPage(company)));
     }
 
     logger.info(`YC directory scrape complete with ${founders.length} founders`);
@@ -621,9 +1242,8 @@ export async function scrapeYcDirectory(
         error instanceof Error ? error.message : String(error)
       }`,
     );
+
     return [];
-  } finally {
-    await browser.close();
   }
 }
 
@@ -651,38 +1271,158 @@ export async function scrapeHnLaunchPosts(
   }
 }
 
+export async function scrapeStartupWhoAccelerators(
+  options: ScrapeOptions = {},
+): Promise<Founder[]> {
+  const maxFounders = options.maxResults ?? 20;
+  const publicSources = PUBLIC_PAGE_SOURCES;
+  const perSourceLimit = Math.max(
+    2,
+    Math.ceil(maxFounders / publicSources.length),
+  );
+  const founders: Founder[] = [];
+
+  for (const accelerator of publicSources) {
+    if (founders.length >= maxFounders) {
+      break;
+    }
+
+    const sourceStartCount = founders.length;
+
+    if (accelerator.startupWhoSlug) {
+      try {
+        const response = await axios.get<string>(
+          buildStartupWhoUrl(accelerator.startupWhoSlug),
+          {
+            timeout: 20_000,
+            headers: {
+              Accept: "text/html",
+            },
+          },
+        );
+
+        founders.push(
+          ...extractStartupWhoAcceleratorFoundersFromHtml(
+            response.data,
+            accelerator as StartupWhoAcceleratorSource,
+          ).slice(0, perSourceLimit),
+        );
+      } catch (error) {
+        logger.warn(
+          `StartupWho ${accelerator.label} scrape failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
+    if (founders.length >= maxFounders || !accelerator.officialUrls?.length) {
+      continue;
+    }
+
+    for (const officialUrl of accelerator.officialUrls) {
+      if (founders.length >= maxFounders) {
+        break;
+      }
+
+      try {
+        const response = await axios.get<string>(officialUrl, {
+          timeout: 20_000,
+          headers: {
+            Accept: "text/html",
+          },
+        });
+
+        founders.push(
+          ...extractOfficialPortfolioFoundersFromHtml(
+            response.data,
+            accelerator,
+            officialUrl,
+          ).slice(0, perSourceLimit),
+        );
+      } catch (error) {
+        logger.warn(
+          `Official ${accelerator.label} scrape failed for ${officialUrl}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
+    logger.info(
+      `Public source ${accelerator.label} returned ${
+        founders.length - sourceStartCount
+      } founders`,
+    );
+  }
+
+  const sliced = founders.slice(0, maxFounders);
+  logger.info(
+    `Public founder source scrape complete with ${sliced.length} founders`,
+  );
+  return sliced;
+}
+
 export async function scrapeNitterPosts(
   options: ScrapeOptions = {},
 ): Promise<RawCandidate[]> {
   const visitedUrls = options.visitedUrls ?? new Set<string>();
+  const maxResults = options.maxResults ?? 20;
   const browser = await launchStealthBrowser();
 
   try {
     const results: RawCandidate[] = [];
     const seen = new Set<string>();
 
-    for (const query of NITTER_QUERIES) {
-      const searchUrl = `${NITTER_BASE_URL}/search?f=tweets&q=${encodeURIComponent(
-        query,
-      )}`;
-      const page = await fetchHtmlWithBrowser(browser, searchUrl, {
-        visitedUrls,
-      });
+    for (const baseUrl of config.NITTER_BASE_URLS) {
+      let hostResponded = false;
 
-      if (!page) {
-        continue;
+      for (const query of NITTER_QUERIES) {
+        const searchUrl = `${baseUrl}/search?f=tweets&q=${encodeURIComponent(
+          query,
+        )}`;
+
+        try {
+          const page = await fetchHtmlWithBrowser(browser, searchUrl, {
+            visitedUrls,
+          });
+
+          if (!page) {
+            continue;
+          }
+
+          hostResponded = true;
+
+          for (const candidate of extractNitterCandidatesFromHtml(
+            page.html,
+            query,
+          )) {
+            const key = `${candidate.twitterHandle ?? "unknown"}|${candidate.rawText}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              results.push(candidate);
+            }
+          }
+        } catch (error) {
+          logger.warn(
+            `Nitter query failed on ${baseUrl} for "${query}": ${summarizeError(
+              error,
+            )}`,
+          );
+          break;
+        }
+
+        if (results.length >= maxResults) {
+          break;
+        }
       }
 
-      for (const candidate of extractNitterCandidatesFromHtml(page.html, query)) {
-        const key = `${candidate.twitterHandle ?? "unknown"}|${candidate.rawText}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          results.push(candidate);
-        }
+      if (hostResponded || results.length >= maxResults) {
+        break;
       }
     }
 
-    const sliced = results.slice(0, options.maxResults ?? 20);
+    const sliced = results.slice(0, maxResults);
     logger.info(`Nitter scrape complete with ${sliced.length} candidates`);
     return sliced;
   } catch (error) {

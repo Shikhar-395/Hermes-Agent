@@ -1,17 +1,21 @@
-import axios, { AxiosError } from "axios";
+import axios from "axios";
 import type { Browser } from "playwright";
 
 import {
   fetchHtmlWithBrowser,
   launchStealthBrowser,
 } from "./browser-utils.js";
-import { config } from "./config.js";
+import { hasEngineeringHiringSignal } from "./lead-utils.js";
 import { logger } from "./logger.js";
 import type { EnrichedProfile, Founder } from "./types.js";
 
 export interface SearchDependencies {
   browser?: Browser;
   fetchSearchHtml?: (query: string) => Promise<string | null>;
+}
+
+export interface CareersDependencies {
+  fetchUrl?: (url: string) => Promise<string | null>;
 }
 
 function cleanText(value: string | null | undefined): string {
@@ -35,19 +39,6 @@ export function normalizeWebsiteUrl(value: string | null): string | null {
   }
 }
 
-export function extractDomainFromWebsite(value: string | null): string | null {
-  const website = normalizeWebsiteUrl(value);
-  if (!website) {
-    return null;
-  }
-
-  try {
-    return new URL(website).hostname.replace(/^www\./, "");
-  } catch {
-    return null;
-  }
-}
-
 export function normalizeTwitterHandle(
   handle: string | null | undefined,
 ): string | null {
@@ -59,7 +50,7 @@ export function buildTwitterUrlFromHandle(
   handle: string | null | undefined,
 ): string | null {
   const normalized = normalizeTwitterHandle(handle);
-  return normalized ? `https://twitter.com/${normalized}` : null;
+  return normalized ? `https://x.com/${normalized}` : null;
 }
 
 export function extractResultUrlsFromGoogleHtml(html: string): string[] {
@@ -152,87 +143,103 @@ export async function findTwitterUrl(
   dependencies?: SearchDependencies,
 ): Promise<string | null> {
   return searchGoogleProfile(
-    `${founderName} ${companyName} site:twitter.com`,
-    (url) => /twitter\.com\/(?!share|home|search)/i.test(url),
+    `${founderName} ${companyName} (site:x.com OR site:twitter.com)`,
+    (url) => /(twitter|x)\.com\/(?!share|home|search|intent|i\/)/i.test(url),
     dependencies,
   );
 }
 
-export async function findEmailWithHunter(
-  founderName: string,
-  website: string | null,
-  options?: {
-    httpClient?: Pick<typeof axios, "get">;
-  },
-): Promise<string | null> {
-  const httpClient = options?.httpClient ?? axios;
-  const domain = extractDomainFromWebsite(website);
-
-  if (!domain) {
-    return null;
-  }
-
-  const parts = founderName.trim().split(/\s+/);
-  const firstName = parts[0] ?? "";
-  const lastName = parts.slice(1).join(" ");
-
+async function fetchUrlHtml(url: string): Promise<string | null> {
   try {
-    const response = await httpClient.get<{
-      data?: {
-        email?: string | null;
-      };
-    }>("https://api.hunter.io/v2/email-finder", {
-      params: {
-        domain,
-        first_name: firstName,
-        last_name: lastName,
-        api_key: config.HUNTER_API_KEY,
+    const response = await axios.get<string>(url, {
+      timeout: 8_000,
+      headers: {
+        Accept: "text/html",
       },
-      timeout: 20_000,
+      validateStatus: (status) => status >= 200 && status < 400,
     });
 
-    return response.data.data?.email ?? null;
-  } catch (error) {
-    if (
-      error instanceof AxiosError &&
-      (error.response?.status === 429 ||
-        `${error.response?.data ?? ""}`.includes("quota"))
-    ) {
-      logger.warn(`Hunter quota hit for domain ${domain}`);
-      return null;
-    }
-
-    logger.error(
-      `Hunter email lookup failed for ${founderName} at ${domain}: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
+    return typeof response.data === "string" ? response.data : null;
+  } catch {
     return null;
   }
+}
+
+function buildCareersCandidates(website: string | null): string[] {
+  const normalized = normalizeWebsiteUrl(website);
+  if (!normalized) {
+    return [];
+  }
+
+  const parsed = new URL(normalized);
+  const origin = parsed.origin;
+  return [
+    `${origin}/careers`,
+    `${origin}/jobs`,
+    `${origin}/join-us`,
+    `${origin}/join`,
+    `${origin}/about`,
+  ];
+}
+
+export async function findCareersSignal(
+  website: string | null,
+  dependencies?: CareersDependencies,
+): Promise<{
+  careersUrl: string | null;
+  engineeringHiringSignal: boolean;
+}> {
+  const fetcher = dependencies?.fetchUrl ?? fetchUrlHtml;
+
+  for (const url of buildCareersCandidates(website)) {
+    const html = await fetcher(url);
+    if (!html) {
+      continue;
+    }
+
+    const text = cleanText(html.replace(/<[^>]+>/g, " "));
+    const looksLikeCareersPage = /\b(careers|jobs|open roles|join us|hiring)\b/i.test(
+      `${url} ${text}`,
+    );
+    const engineeringHiringSignal = hasEngineeringHiringSignal(text);
+
+    if (looksLikeCareersPage || engineeringHiringSignal) {
+      return {
+        careersUrl: url,
+        engineeringHiringSignal,
+      };
+    }
+  }
+
+  return {
+    careersUrl: null,
+    engineeringHiringSignal: false,
+  };
 }
 
 export async function enrichFounderProfile(
   founder: Founder,
   dependencies?: {
     search?: SearchDependencies;
-    httpClient?: Pick<typeof axios, "get">;
+    careers?: CareersDependencies;
   },
 ): Promise<EnrichedProfile> {
   const website = normalizeWebsiteUrl(founder.website) ?? founder.website;
   const twitterUrlFromHandle = founder.twitterUrl ?? buildTwitterUrlFromHandle(founder.twitterHandle);
 
-  const [linkedinUrl, discoveredTwitterUrl, email] = await Promise.all([
+  const [linkedinUrl, discoveredTwitterUrl, careersSignal] = await Promise.all([
     founder.linkedinUrl
       ? Promise.resolve(founder.linkedinUrl)
       : findLinkedInUrl(founder.founderName, founder.companyName, dependencies?.search),
     twitterUrlFromHandle
       ? Promise.resolve(twitterUrlFromHandle)
       : findTwitterUrl(founder.founderName, founder.companyName, dependencies?.search),
-    founder.email
-      ? Promise.resolve(founder.email)
-      : findEmailWithHunter(founder.founderName, website, {
-          httpClient: dependencies?.httpClient,
-        }),
+    founder.careersUrl
+      ? Promise.resolve({
+          careersUrl: founder.careersUrl,
+          engineeringHiringSignal: Boolean(founder.engineeringHiringSignal),
+        })
+      : findCareersSignal(website, dependencies?.careers),
   ]);
 
   return {
@@ -240,6 +247,8 @@ export async function enrichFounderProfile(
     website,
     linkedinUrl,
     twitterUrl: discoveredTwitterUrl,
-    email,
+    careersUrl: careersSignal.careersUrl,
+    engineeringHiringSignal: careersSignal.engineeringHiringSignal,
+    email: founder.email,
   };
 }

@@ -5,15 +5,18 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  calculateApiCost,
   closeDb,
   createRun,
   finishRun,
   getAgentState,
   getStats,
+  getTotalSpend,
   getUnsentFounders,
   initDb,
   insertFounder,
   isDuplicate,
+  logApiUsage,
   markAsSent,
   setAgentState,
   incrementRunStat,
@@ -80,5 +83,20 @@ test("database persists run stats and agent state", () => {
   );
 
   assert.deepEqual(getStats(), stats);
+  closeDb();
+});
+
+test("database logs API usage and totals spend", () => {
+  closeDb();
+  initDb(createTempDbPath());
+
+  logApiUsage(1_000_000, 1_000_000);
+  logApiUsage(500_000, 250_000);
+
+  const expectedSpend =
+    calculateApiCost(1_000_000, 1_000_000) +
+    calculateApiCost(500_000, 250_000);
+
+  assert.equal(getTotalSpend(), expectedSpend);
   closeDb();
 });

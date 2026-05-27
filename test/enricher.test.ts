@@ -1,20 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AxiosError } from "axios";
 
 import { clearCachedConfig } from "../src/config.js";
 import {
   buildTwitterUrlFromHandle,
   enrichFounderProfile,
   extractResultUrlsFromGoogleHtml,
-  findEmailWithHunter,
+  findCareersSignal,
 } from "../src/enricher.js";
 
 function configureEnv(): void {
   process.env.DEEPSEEK_API_KEY = "deepseek-key";
   process.env.TELEGRAM_BOT_TOKEN = "telegram-token";
   process.env.TELEGRAM_CHAT_ID = "12345";
-  process.env.HUNTER_API_KEY = "hunter-key";
   clearCachedConfig();
 }
 
@@ -30,34 +28,7 @@ test("extractResultUrlsFromGoogleHtml returns decoded target URLs", () => {
   ]);
 });
 
-test("findEmailWithHunter returns null on quota exhaustion", async () => {
-  configureEnv();
-  const quotaError = new AxiosError(
-    "quota exceeded",
-    undefined,
-    undefined,
-    undefined,
-    {
-      status: 429,
-      statusText: "Too Many Requests",
-      headers: {},
-      config: {} as never,
-      data: "quota exceeded",
-    },
-  );
-
-  const email = await findEmailWithHunter("Alice Johnson", "https://atlasai.com", {
-    httpClient: {
-      get: async () => {
-        throw quotaError;
-      },
-    },
-  });
-
-  assert.equal(email, null);
-});
-
-test("enrichFounderProfile fills in LinkedIn, Twitter, and email", async () => {
+test("enrichFounderProfile fills in LinkedIn and X without email lookup", async () => {
   configureEnv();
   const founder = {
     founderName: "Alice Johnson",
@@ -82,23 +53,42 @@ test("enrichFounderProfile fills in LinkedIn, Twitter, and email", async () => {
           return '<a href="/url?q=https%3A%2F%2Fwww.linkedin.com%2Fin%2Falice-johnson&sa=U">LinkedIn</a>';
         }
 
-        return '<a href="/url?q=https%3A%2F%2Ftwitter.com%2Falicej&sa=U">Twitter</a>';
+        return '<a href="/url?q=https%3A%2F%2Fx.com%2Falicej&sa=U">X</a>';
       },
     },
-    httpClient: {
-      get: async () =>
-        ({
-          data: {
-            data: {
-              email: "alice@atlasai.com",
-            },
-          },
-        }) as never,
+    careers: {
+      fetchUrl: async () => null,
     },
   });
 
   assert.equal(enriched.linkedinUrl, "https://www.linkedin.com/in/alice-johnson");
   assert.equal(enriched.twitterUrl, buildTwitterUrlFromHandle("alicej"));
-  assert.equal(enriched.email, "alice@atlasai.com");
+  assert.equal(enriched.email, null);
   assert.equal(enriched.website, "https://atlasai.com/");
+});
+
+test("findCareersSignal detects engineering roles from common careers pages", async () => {
+  const visited: string[] = [];
+  const signal = await findCareersSignal("https://atlasai.com", {
+    fetchUrl: async (url) => {
+      visited.push(url);
+      if (url.endsWith("/careers")) {
+        return `
+          <html>
+            <body>
+              <h1>Careers</h1>
+              <a>Founding Full-Stack Engineer</a>
+              <a>Backend Developer</a>
+            </body>
+          </html>
+        `;
+      }
+
+      return null;
+    },
+  });
+
+  assert.equal(signal.careersUrl, "https://atlasai.com/careers");
+  assert.equal(signal.engineeringHiringSignal, true);
+  assert.deepEqual(visited, ["https://atlasai.com/careers"]);
 });

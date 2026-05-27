@@ -4,14 +4,24 @@ import { config } from "./config.js";
 import type { DatabaseAdapter } from "./database.js";
 import { database } from "./database.js";
 import { enrichFounderProfile } from "./enricher.js";
+import {
+  isLikelyTechCandidate,
+  prepareFounderLead,
+  getFounderLeadRejectionReasons,
+  shouldConsiderFounderForLead,
+  shouldSendFounderLead,
+  sortFounderLeads,
+} from "./lead-utils.js";
 import { logger } from "./logger.js";
-import { parseRawCandidate } from "./parser.js";
+import { ApiSpendLimitReachedError, parseRawCandidate } from "./parser.js";
 import {
   scrapeHnLaunchPosts,
   scrapeNitterPosts,
   scrapeProductHunt,
+  scrapeStartupWhoAccelerators,
   scrapeYcDirectory,
 } from "./scraper.js";
+import { ALL_SOURCES, getSourceLabel, PUBLIC_PAGE_SOURCES } from "./sources.js";
 import { createTelegramService, type TelegramService } from "./telegram.js";
 import type {
   Founder,
@@ -20,18 +30,36 @@ import type {
   SourceQuotaMap,
 } from "./types.js";
 
-const SOURCE_PRIORITY: ScraperSource[] = [
-  "yc_directory",
-  "hn_launch",
-  "twitter",
-  "producthunt",
-];
+const SOURCE_PRIORITY: ScraperSource[] = ALL_SOURCES;
 
 const SOURCE_WEIGHTS: Record<ScraperSource, number> = {
-  yc_directory: 0.4,
-  hn_launch: 0.25,
-  twitter: 0.2,
-  producthunt: 0.15,
+  yc_directory: 0.16,
+  techstars: 0.08,
+  antler: 0.06,
+  a16z: 0.05,
+  "500global": 0.05,
+  general_catalyst: 0.05,
+  greylock: 0.05,
+  accel: 0.05,
+  index_ventures: 0.04,
+  lightspeed: 0.04,
+  hn_launch: 0.06,
+  twitter: 0.04,
+  producthunt: 0.04,
+  sequoia_arc: 0.03,
+  google_for_startups: 0.03,
+  microsoft_for_startups: 0.03,
+  nvidia_inception: 0.03,
+  founders_fund: 0.03,
+  pear_vc: 0.03,
+  hax: 0.03,
+  plug_and_play: 0.02,
+  entrepreneur_first: 0.02,
+  alchemist: 0.02,
+  neo: 0.02,
+  benchmark: 0.02,
+  on_deck: 0.01,
+  seedcamp: 0.01,
 };
 
 const RUNTIME_STARTED_AT_KEY = "runtime_started_at";
@@ -66,15 +94,14 @@ export function buildCronExpression(intervalHours: number): string {
 }
 
 export function buildSourceQuotas(maxFounders: number): SourceQuotaMap {
-  const base: SourceQuotaMap = {
-    yc_directory: Math.floor(maxFounders * SOURCE_WEIGHTS.yc_directory),
-    hn_launch: Math.floor(maxFounders * SOURCE_WEIGHTS.hn_launch),
-    twitter: Math.floor(maxFounders * SOURCE_WEIGHTS.twitter),
-    producthunt: Math.floor(maxFounders * SOURCE_WEIGHTS.producthunt),
-  };
+  const base = Object.fromEntries(
+    SOURCE_PRIORITY.map((source) => [
+      source,
+      Math.floor(maxFounders * SOURCE_WEIGHTS[source]),
+    ]),
+  ) as SourceQuotaMap;
 
-  let allocated =
-    base.yc_directory + base.hn_launch + base.twitter + base.producthunt;
+  let allocated = Object.values(base).reduce((sum, value) => sum + value, 0);
 
   for (const source of SOURCE_PRIORITY) {
     if (allocated >= maxFounders) {
@@ -177,12 +204,9 @@ export function selectFoundersByQuota(
   quotas: SourceQuotaMap,
   maxFounders: number,
 ): Founder[] {
-  const buckets: Record<ScraperSource, Founder[]> = {
-    yc_directory: [],
-    hn_launch: [],
-    twitter: [],
-    producthunt: [],
-  };
+  const buckets = Object.fromEntries(
+    SOURCE_PRIORITY.map((source) => [source, [] as Founder[]]),
+  ) as Record<ScraperSource, Founder[]>;
 
   for (const founder of founders) {
     buckets[founder.source].push(founder);
@@ -216,11 +240,11 @@ function toTwitterUrl(handle: string | null): string | null {
     return null;
   }
 
-  return `https://twitter.com/${handle.replace(/^@/, "")}`;
+  return `https://x.com/${handle.replace(/^@/, "")}`;
 }
 
-function cleanValue(value: string | null | undefined): string | null {
-  const cleaned = value?.trim() ?? "";
+function cleanValue(value: unknown): string | null {
+  const cleaned = typeof value === "string" ? value.trim() : "";
   return cleaned.length > 0 ? cleaned : null;
 }
 
@@ -255,6 +279,18 @@ function mergeParsedFounder(
     website,
     ycProfileUrl:
       cleanValue(parsed.ycProfileUrl) ?? cleanValue(candidate.ycProfileUrl),
+    sourceProfileUrl:
+      cleanValue(parsed.sourceProfileUrl) ??
+      cleanValue(candidate.sourceProfileUrl) ??
+      cleanValue(parsed.ycProfileUrl) ??
+      cleanValue(candidate.ycProfileUrl) ??
+      website,
+    fundingSource: cleanValue(candidate.fundingSource),
+    fundingDate: cleanValue(candidate.fundingDate),
+    fundingRound: cleanValue(candidate.fundingRound),
+    techCategory: cleanValue(candidate.techCategory),
+    careersUrl: cleanValue(candidate.careersUrl),
+    engineeringHiringSignal: Boolean(candidate.engineeringHiringSignal),
     batch: cleanValue(parsed.batch) ?? cleanValue(candidate.batch),
     source: candidate.source,
     sentAt: null,
@@ -262,13 +298,74 @@ function mergeParsedFounder(
   };
 }
 
-function buildRawScrapeLimits(quotas: SourceQuotaMap): SourceQuotaMap {
+function founderToRawCandidate(founder: Founder): RawCandidate {
   return {
-    yc_directory: Math.max(10, quotas.yc_directory * 2),
-    hn_launch: Math.max(10, quotas.hn_launch * 3),
-    twitter: Math.max(10, quotas.twitter * 3),
-    producthunt: Math.max(10, quotas.producthunt * 3),
+    source: founder.source,
+    rawText: [
+      `Source: ${founder.source}`,
+      `Founder: ${founder.founderName}`,
+      `Company: ${founder.companyName}`,
+      founder.companyDescription
+        ? `Description: ${founder.companyDescription}`
+        : null,
+      founder.linkedinUrl ? `LinkedIn: ${founder.linkedinUrl}` : null,
+      founder.twitterHandle ? `Twitter Handle: ${founder.twitterHandle}` : null,
+      founder.twitterUrl ? `Twitter: ${founder.twitterUrl}` : null,
+      founder.website ? `Website: ${founder.website}` : null,
+      founder.ycProfileUrl ? `YC Profile: ${founder.ycProfileUrl}` : null,
+      founder.batch ? `Batch: ${founder.batch}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    founderName: founder.founderName,
+    companyName: founder.companyName,
+    companyDescription: founder.companyDescription,
+    website: founder.website,
+    ycProfileUrl: founder.ycProfileUrl,
+    sourceProfileUrl:
+      founder.sourceProfileUrl ?? founder.ycProfileUrl ?? founder.website,
+    fundingSource: founder.fundingSource,
+    fundingDate: founder.fundingDate,
+    fundingRound: founder.fundingRound,
+    techCategory: founder.techCategory,
+    careersUrl: founder.careersUrl,
+    engineeringHiringSignal: founder.engineeringHiringSignal,
+    twitterHandle: founder.twitterHandle,
+    batch: founder.batch,
   };
+}
+
+function buildRawScrapeLimits(quotas: SourceQuotaMap): SourceQuotaMap {
+  return Object.fromEntries(
+    SOURCE_PRIORITY.map((source) => [
+      source,
+      Math.max(
+        10,
+        quotas[source] *
+          (["hn_launch", "twitter", "producthunt"].includes(source) ? 3 : 2),
+      ),
+    ]),
+  ) as SourceQuotaMap;
+}
+
+function sumQuotasForSources(
+  quotas: SourceQuotaMap,
+  sources: ScraperSource[],
+): number {
+  return sources.reduce((sum, source) => sum + quotas[source], 0);
+}
+
+function formatFounderCountsBySource(founders: Founder[]): string {
+  const counts = new Map<ScraperSource, number>();
+
+  for (const founder of founders) {
+    counts.set(founder.source, (counts.get(founder.source) ?? 0) + 1);
+  }
+
+  return [...counts.entries()]
+    .sort(([left], [right]) => SOURCE_PRIORITY.indexOf(left) - SOURCE_PRIORITY.indexOf(right))
+    .map(([source, count]) => `${getSourceLabel(source)}=${count}`)
+    .join(", ");
 }
 
 export interface SchedulerDependencies {
@@ -278,9 +375,11 @@ export interface SchedulerDependencies {
   scrapeHnLaunchPosts: typeof scrapeHnLaunchPosts;
   scrapeNitterPosts: typeof scrapeNitterPosts;
   scrapeProductHunt: typeof scrapeProductHunt;
+  scrapeStartupWhoAccelerators: typeof scrapeStartupWhoAccelerators;
   parseRawCandidate: typeof parseRawCandidate;
   enrichFounderProfile: typeof enrichFounderProfile;
   now: () => Date;
+  exitProcess?: (code: number) => never | void;
 }
 
 export class HermesScheduler {
@@ -291,6 +390,12 @@ export class HermesScheduler {
   public constructor(private readonly dependencies: SchedulerDependencies) {}
 
   public async start(): Promise<void> {
+    if (config.DRY_RUN) {
+      logger.info("DRY_RUN=true; executing one dry run without cron scheduler");
+      await this.executeDryRun();
+      return;
+    }
+
     const cronExpression = buildCronExpression(config.RUN_INTERVAL_HOURS);
     logger.info(`Starting scheduler with cron expression ${cronExpression}`);
 
@@ -311,6 +416,289 @@ export class HermesScheduler {
     logger.info(`Scheduler stopped (${reason})`);
   }
 
+  private isApiSpendLimitReached(): boolean {
+    return this.dependencies.db.getTotalSpend() >= config.MAX_API_SPEND_USD;
+  }
+
+  private exitProcess(code: number): void {
+    const exitProcess =
+      this.dependencies.exitProcess ??
+      ((exitCode: number): never => process.exit(exitCode));
+    exitProcess(code);
+  }
+
+  private async stopForApiSpendLimitReached(): Promise<void> {
+    const totalFounders = this.dependencies.db.getTotalFoundersFound();
+
+    console.log("🛑 Spend limit reached — shutting down");
+    await this.dependencies.telegram.sendSpendLimitReachedMessage(
+      config.MAX_API_SPEND_USD,
+      totalFounders,
+    );
+    await this.stop("api-spend-limit-reached");
+    this.dependencies.db.closeDb();
+    this.exitProcess(0);
+  }
+
+  private async executeDryRun(): Promise<void> {
+    if (this.isApiSpendLimitReached()) {
+      await this.stopForApiSpendLimitReached();
+      return;
+    }
+
+    this.isRunning = true;
+    const runStartedAt = this.dependencies.now().toISOString();
+    const runId = this.dependencies.db.createRun(runStartedAt);
+    let exitCode = 0;
+    let handledSpendLimit = false;
+
+    console.log("🧪 Dry run mode enabled — cron scheduler will not start");
+    console.log("🧪 Dry run: scraping sources (max 3 founders)");
+
+    try {
+      const visitedUrls = new Set<string>();
+      const scrapedFounders = (
+        await this.dependencies.scrapeYcDirectory({
+          maxResults: 3,
+          visitedUrls,
+          dryRun: true,
+        })
+      ).slice(0, 3);
+
+      console.log(
+        `🧪 Dry run: YC directory returned ${scrapedFounders.length} founders`,
+      );
+
+      const parsedFounders: Founder[] = scrapedFounders
+        .map(prepareFounderLead)
+        .filter(shouldConsiderFounderForLead);
+
+      if (scrapedFounders.length > 0) {
+        console.log(
+          `🧪 Dry run: kept ${parsedFounders.length}/${scrapedFounders.length} YC founders after deterministic tech/recency filters`,
+        );
+      }
+
+      if (parsedFounders.length === 0) {
+        const warning =
+          "Dry run: YC directory produced 0 usable leads; trying public founder sources";
+        logger.warn(warning);
+        console.warn(`⚠️ ${warning}`);
+
+        console.log("🧪 Dry run: scraping public founder sources (max 3 founders)");
+
+        const acceleratorFounders = (
+          await this.dependencies.scrapeStartupWhoAccelerators({
+            maxResults: 3,
+            visitedUrls,
+            dryRun: true,
+          })
+        ).slice(0, 3);
+
+        console.log(
+          `🧪 Dry run: public founder sources returned ${acceleratorFounders.length} founders`,
+        );
+
+        parsedFounders.push(
+          ...acceleratorFounders
+            .map(prepareFounderLead)
+            .filter(shouldConsiderFounderForLead),
+        );
+
+        const fallbackSources = [
+          {
+            label: "Launch HN",
+            scrape: this.dependencies.scrapeHnLaunchPosts,
+          },
+          {
+            label: "Nitter",
+            scrape: this.dependencies.scrapeNitterPosts,
+          },
+          {
+            label: "Product Hunt",
+            scrape: this.dependencies.scrapeProductHunt,
+          },
+        ];
+
+        const shouldTryPaidDryRunFallback =
+          parsedFounders.length === 0 && config.DRY_RUN_USE_LLM;
+        if (!config.DRY_RUN_USE_LLM && parsedFounders.length === 0) {
+          console.log(
+            "🧪 Dry run: skipping raw social/news parsing because DRY_RUN_USE_LLM=false",
+          );
+        }
+
+        for (const source of shouldTryPaidDryRunFallback ? fallbackSources : []) {
+          console.log(`🧪 Dry run: scraping ${source.label} (max 3 candidates)`);
+
+          let rawCandidates: RawCandidate[] = [];
+          try {
+            rawCandidates = (
+              await source.scrape({
+                maxResults: 3,
+                visitedUrls,
+              })
+            ).slice(0, 3);
+          } catch (error) {
+            if (error instanceof ApiSpendLimitReachedError) {
+              throw error;
+            }
+
+            const message = `Dry run: ${source.label} scrape failed; trying next source: ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+            logger.warn(message);
+            console.warn(`⚠️ ${message}`);
+            continue;
+          }
+
+          console.log(
+            `🧪 Dry run: ${source.label} returned ${rawCandidates.length} candidates`,
+          );
+
+          if (rawCandidates.length === 0) {
+            const message = `Dry run: ${source.label} returned 0 candidates; trying next source`;
+            logger.warn(message);
+            console.warn(`⚠️ ${message}`);
+            continue;
+          }
+
+          const candidatesToParse = rawCandidates
+            .filter(isLikelyTechCandidate)
+            .slice(0, Math.min(3, config.LLM_PARSE_MAX_PER_RUN));
+
+          for (const [index, candidate] of candidatesToParse.entries()) {
+            console.log(
+              `🧠 Dry run: parsing ${source.label} candidate ${index + 1}/${candidatesToParse.length} with DeepSeek`,
+            );
+
+            try {
+              const parsed =
+                await this.dependencies.parseRawCandidate(candidate);
+              const merged = parsed
+                ? mergeParsedFounder(candidate, parsed)
+                : null;
+
+              if (merged) {
+                parsedFounders.push(merged);
+              }
+            } catch (error) {
+              if (error instanceof ApiSpendLimitReachedError) {
+                throw error;
+              }
+
+              const message = `Dry run: parsing ${source.label} candidate failed: ${
+                error instanceof Error ? error.message : String(error)
+              }`;
+              logger.warn(message);
+              console.warn(`⚠️ ${message}`);
+            }
+          }
+
+          if (parsedFounders.length > 0) {
+            break;
+          }
+
+          const message = `Dry run: ${source.label} produced 0 founders; trying next source`;
+          logger.warn(message);
+          console.warn(`⚠️ ${message}`);
+        }
+      }
+
+      if (parsedFounders.length === 0) {
+        throw new Error("Dry run found 0 founders across all sources");
+      }
+
+      const enrichedFounders: Founder[] = [];
+
+      for (const [index, founder] of parsedFounders.entries()) {
+        console.log(
+          `🔎 Dry run: enriching founder ${index + 1}/${parsedFounders.length} — ${founder.founderName} / ${founder.companyName}`,
+        );
+
+        const enriched = prepareFounderLead(
+          await this.dependencies.enrichFounderProfile(founder),
+        );
+
+        if (!shouldSendFounderLead(enriched)) {
+          const reasons = getFounderLeadRejectionReasons(enriched).join(", ");
+          logger.info(
+            `Dry run: skipping ${enriched.founderName} / ${enriched.companyName}: ${
+              reasons || "lead requirements were not met"
+            }`,
+          );
+          continue;
+        }
+
+        if (
+          this.dependencies.db.isDuplicate(
+            enriched.founderName,
+            enriched.companyName,
+          )
+        ) {
+          this.dependencies.db.incrementRunStat(runId, "duplicatesSkipped");
+          continue;
+        }
+
+        const inserted = this.dependencies.db.insertFounder({
+          ...enriched,
+          sentAt: null,
+          createdAt: enriched.createdAt || this.dependencies.now().toISOString(),
+        });
+        this.dependencies.db.incrementRunStat(runId, "foundersFound");
+        enrichedFounders.push(inserted);
+      }
+
+      const founderToSend = enrichedFounders[0];
+      if (!founderToSend) {
+        throw new Error(
+          "Dry run could not send Telegram message because no founders were found",
+        );
+      }
+
+      console.log(
+        `📨 Dry run: sending exactly 1 founder message to Telegram — ${founderToSend.founderName} / ${founderToSend.companyName}`,
+      );
+
+      const sent = await this.dependencies.telegram.sendFounder(founderToSend);
+      if (!sent) {
+        this.dependencies.db.incrementRunStat(runId, "errors");
+        throw new Error("Dry run Telegram founder message failed");
+      }
+
+      if (founderToSend.id) {
+        this.dependencies.db.markAsSent(founderToSend.id);
+      }
+      this.dependencies.db.incrementRunStat(runId, "foundersSent");
+
+      const totalSpend = this.dependencies.db.getTotalSpend();
+      console.log(
+        `✅ Dry run complete — ${enrichedFounders.length} founders found, $${totalSpend.toFixed(4)} spent, Telegram working`,
+      );
+    } catch (error) {
+      if (error instanceof ApiSpendLimitReachedError) {
+        handledSpendLimit = true;
+        this.dependencies.db.finishRun(runId);
+        this.isRunning = false;
+        await this.stopForApiSpendLimitReached();
+        return;
+      }
+
+      exitCode = 1;
+      const message = error instanceof Error ? error.message : String(error);
+      this.dependencies.db.incrementRunStat(runId, "errors");
+      logger.error(`Dry run failed: ${message}`);
+      console.error(`❌ Dry run failed: ${message}`);
+    } finally {
+      if (!handledSpendLimit) {
+        this.dependencies.db.finishRun(runId);
+        this.isRunning = false;
+        this.dependencies.db.closeDb();
+        this.exitProcess(exitCode);
+      }
+    }
+  }
+
   private async executeRun(trigger: "startup" | "scheduled"): Promise<void> {
     if (this.isStopped) {
       return;
@@ -318,6 +706,12 @@ export class HermesScheduler {
 
     if (this.isRunning) {
       logger.warn(`Skipping ${trigger} run because a previous run is still active`);
+      return;
+    }
+
+    if (this.isApiSpendLimitReached()) {
+      logger.info("API spend limit reached before run start; stopping Hermes Agent");
+      await this.stopForApiSpendLimitReached();
       return;
     }
 
@@ -338,16 +732,25 @@ export class HermesScheduler {
     await this.dependencies.telegram.sendRunStartMessage(runId);
     logger.info(`Run #${runId} started at ${runStartedAt}`);
 
+    let shouldStopForApiSpendLimit = false;
+
     try {
       await this.retryUnsentFounders(runId);
       await this.processFreshFounders(runId);
     } catch (error) {
-      logger.error(
-        `Run #${runId} failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      this.dependencies.db.incrementRunStat(runId, "errors");
+      if (error instanceof ApiSpendLimitReachedError) {
+        shouldStopForApiSpendLimit = true;
+        logger.info(
+          `API spend limit reached during run #${runId}: $${error.totalSpend.toFixed(4)} / $${error.limit.toFixed(2)}`,
+        );
+      } else {
+        logger.error(
+          `Run #${runId} failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        this.dependencies.db.incrementRunStat(runId, "errors");
+      }
     } finally {
       const stats =
         this.dependencies.db.finishRun(runId) ?? {
@@ -364,6 +767,11 @@ export class HermesScheduler {
       );
 
       this.isRunning = false;
+
+      if (shouldStopForApiSpendLimit || this.isApiSpendLimitReached()) {
+        await this.stopForApiSpendLimitReached();
+        return;
+      }
 
       const refreshedRuntimeStartedAt =
         this.dependencies.db.getAgentState(RUNTIME_STARTED_AT_KEY)?.value ??
@@ -406,6 +814,13 @@ export class HermesScheduler {
         maxResults: rawLimits.yc_directory,
         visitedUrls,
       }),
+      this.dependencies.scrapeStartupWhoAccelerators({
+        maxResults: sumQuotasForSources(
+          rawLimits,
+          PUBLIC_PAGE_SOURCES.map((source) => source.source),
+        ),
+        visitedUrls,
+      }),
       this.dependencies.scrapeHnLaunchPosts({
         maxResults: rawLimits.hn_launch,
         visitedUrls,
@@ -422,12 +837,14 @@ export class HermesScheduler {
 
     const ycFounders =
       scrapeResults[0].status === "fulfilled" ? scrapeResults[0].value : [];
-    const hnCandidates =
+    const acceleratorFounders =
       scrapeResults[1].status === "fulfilled" ? scrapeResults[1].value : [];
-    const twitterCandidates =
+    const hnCandidates =
       scrapeResults[2].status === "fulfilled" ? scrapeResults[2].value : [];
-    const productHuntCandidates =
+    const twitterCandidates =
       scrapeResults[3].status === "fulfilled" ? scrapeResults[3].value : [];
+    const productHuntCandidates =
+      scrapeResults[4].status === "fulfilled" ? scrapeResults[4].value : [];
 
     for (const result of scrapeResults) {
       if (result.status === "rejected") {
@@ -436,11 +853,31 @@ export class HermesScheduler {
     }
 
     const parsedFounders: Founder[] = [];
+    const structuredFounders = [
+      ...ycFounders.map(prepareFounderLead),
+      ...acceleratorFounders.map(prepareFounderLead),
+    ];
+    logger.info(
+      `Structured candidates by source before filters: ${
+        formatFounderCountsBySource(structuredFounders) || "none"
+      }`,
+    );
+
     const rawCandidates = [
       ...hnCandidates,
       ...twitterCandidates,
       ...productHuntCandidates,
-    ];
+    ]
+      .filter(isLikelyTechCandidate)
+      .slice(0, config.LLM_PARSE_MAX_PER_RUN);
+
+    if (config.LLM_PARSE_MAX_PER_RUN === 0) {
+      logger.info("Skipping raw social/news LLM parsing because LLM_PARSE_MAX_PER_RUN=0");
+    } else {
+      logger.info(
+        `Raw candidates selected for LLM parsing after tech filter: ${rawCandidates.length}`,
+      );
+    }
 
     for (const candidate of rawCandidates) {
       try {
@@ -454,6 +891,10 @@ export class HermesScheduler {
           parsedFounders.push(merged);
         }
       } catch (error) {
+        if (error instanceof ApiSpendLimitReachedError) {
+          throw error;
+        }
+
         logger.error(
           `Candidate parsing failed: ${
             error instanceof Error ? error.message : String(error)
@@ -463,7 +904,17 @@ export class HermesScheduler {
       }
     }
 
-    const deduped = dedupeFoundersForRun([...ycFounders, ...parsedFounders]);
+    const consideredFounders = [
+      ...structuredFounders.filter(shouldConsiderFounderForLead),
+      ...parsedFounders.map(prepareFounderLead).filter(shouldConsiderFounderForLead),
+    ];
+    logger.info(
+      `Lead candidates by source after tech/recency filters: ${
+        formatFounderCountsBySource(consideredFounders) || "none"
+      }`,
+    );
+
+    const deduped = dedupeFoundersForRun(consideredFounders);
     if (deduped.duplicatesSkipped > 0) {
       this.dependencies.db.incrementRunStat(
         runId,
@@ -472,15 +923,27 @@ export class HermesScheduler {
       );
     }
 
-    const selected = selectFoundersByQuota(
+    const selected = sortFounderLeads(selectFoundersByQuota(
       deduped.unique,
       quotas,
       config.MAX_FOUNDERS_PER_RUN,
-    );
+    ));
 
     for (const founder of selected) {
       try {
-        const enriched = await this.dependencies.enrichFounderProfile(founder);
+        const enriched = prepareFounderLead(
+          await this.dependencies.enrichFounderProfile(founder),
+        );
+
+        if (!shouldSendFounderLead(enriched)) {
+          const reasons = getFounderLeadRejectionReasons(enriched).join(", ");
+          logger.info(
+            `Skipping ${enriched.founderName} / ${enriched.companyName}: ${
+              reasons || "lead requirements were not met"
+            }`,
+          );
+          continue;
+        }
 
         if (
           this.dependencies.db.isDuplicate(
@@ -528,6 +991,7 @@ export function createDefaultScheduler(
     scrapeHnLaunchPosts,
     scrapeNitterPosts,
     scrapeProductHunt,
+    scrapeStartupWhoAccelerators,
     parseRawCandidate,
     enrichFounderProfile,
     now: () => new Date(),

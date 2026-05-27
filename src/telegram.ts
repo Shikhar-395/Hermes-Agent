@@ -2,6 +2,7 @@ import TelegramBot from "node-telegram-bot-api";
 
 import { config } from "./config.js";
 import { logger } from "./logger.js";
+import { getSourceLabel } from "./sources.js";
 import type { Founder, RunStats } from "./types.js";
 
 export interface TelegramBotLike {
@@ -14,18 +15,36 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
+function formatFounderHeadline(founder: Founder): string {
+  if (founder.batch) {
+    return `🚀 New Founder Found — ${founder.batch} Batch`;
+  }
+
+  return `🚀 New Founder Found — ${getSourceLabel(founder.source)}`;
+}
+
 export function formatFounderMessage(founder: Founder): string {
+  const profileUrl =
+    founder.sourceProfileUrl ?? founder.ycProfileUrl ?? founder.website ?? null;
+  const hiringSignal = founder.engineeringHiringSignal
+    ? "Engineering roles detected"
+    : "No engineering role detected yet";
+
   return [
-    `🚀 New Founder Found — ${founder.batch ?? "Unknown"} Batch`,
+    formatFounderHeadline(founder),
     `👤 Name: ${founder.founderName}`,
     `🏢 Company: ${founder.companyName}`,
     `📝 About: ${founder.companyDescription ?? "Not found"}`,
+    `🧭 Tech fit: ${founder.techCategory ?? "Tech/software signal"}`,
+    `💸 Funding/source: ${founder.fundingSource ?? getSourceLabel(founder.source)}`,
+    `📅 Funding date: ${founder.fundingDate ?? founder.batch ?? "Not found"}`,
     `🔗 LinkedIn: ${founder.linkedinUrl ?? "Not found"}`,
-    `🐦 Twitter: ${founder.twitterUrl ?? "Not found"}`,
-    `📧 Email: ${founder.email ?? "Not found"}`,
+    `🐦 X: ${founder.twitterUrl ?? "Not found"}`,
     `🌐 Website: ${founder.website ?? "Not found"}`,
-    `📌 YC Profile: ${founder.ycProfileUrl ?? founder.website ?? "Not found"}`,
-    `📡 Source: ${founder.source}`,
+    `🧑‍💻 Careers/apply: ${founder.careersUrl ?? "Not found"}`,
+    `🟢 Hiring signal: ${hiringSignal}`,
+    `📌 Source profile: ${profileUrl ?? "Not found"}`,
+    `📡 Source: ${getSourceLabel(founder.source)}`,
     `⏰ Found: ${founder.createdAt}`,
   ].join("\n");
 }
@@ -36,6 +55,13 @@ function formatRunStartMessage(runId: number): string {
 
 function formatRunEndMessage(runId: number, stats: RunStats): string {
   return `✅ Run #${runId} complete — Found: ${stats.foundersFound} | Sent: ${stats.foundersSent} | Skipped: ${stats.duplicatesSkipped} duplicates`;
+}
+
+function formatSpendLimitReachedMessage(
+  limitUsd: number,
+  totalFounders: number,
+): string {
+  return `🛑 Hermes Agent stopped — $${limitUsd.toFixed(2)} spend limit reached. Total founders found: ${totalFounders}`;
 }
 
 export class TelegramService {
@@ -81,6 +107,10 @@ export class TelegramService {
     );
   }
 
+  public async sendTestPing(): Promise<boolean> {
+    return this.send("🤖 Hermes Agent Telegram test ping");
+  }
+
   public async sendShutdownMessage(): Promise<boolean> {
     return this.send("🛑 Hermes Agent is shutting down gracefully.");
   }
@@ -94,6 +124,13 @@ export class TelegramService {
     stats: RunStats,
   ): Promise<boolean> {
     return this.send(formatRunEndMessage(runId, stats));
+  }
+
+  public async sendSpendLimitReachedMessage(
+    limitUsd: number,
+    totalFounders: number,
+  ): Promise<boolean> {
+    return this.send(formatSpendLimitReachedMessage(limitUsd, totalFounders));
   }
 
   public async sendFounder(founder: Founder): Promise<boolean> {

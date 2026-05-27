@@ -2,7 +2,30 @@ export type ScraperSource =
   | "yc_directory"
   | "hn_launch"
   | "twitter"
-  | "producthunt";
+  | "producthunt"
+  | "techstars"
+  | "antler"
+  | "seedcamp"
+  | "a16z"
+  | "500global"
+  | "sequoia_arc"
+  | "entrepreneur_first"
+  | "plug_and_play"
+  | "alchemist"
+  | "neo"
+  | "pear_vc"
+  | "hax"
+  | "on_deck"
+  | "google_for_startups"
+  | "microsoft_for_startups"
+  | "nvidia_inception"
+  | "lightspeed"
+  | "benchmark"
+  | "general_catalyst"
+  | "founders_fund"
+  | "greylock"
+  | "accel"
+  | "index_ventures";
 
 export interface Founder {
   id?: number;
@@ -15,6 +38,13 @@ export interface Founder {
   email: string | null;
   website: string | null;
   ycProfileUrl: string | null;
+  sourceProfileUrl?: string | null;
+  fundingSource?: string | null;
+  fundingDate?: string | null;
+  fundingRound?: string | null;
+  techCategory?: string | null;
+  careersUrl?: string | null;
+  engineeringHiringSignal?: boolean;
   batch: string | null;
   source: ScraperSource;
   sentAt: string | null;
@@ -29,6 +59,7 @@ export interface DeepSeekResponse {
   twitterHandle: string | null;
   website: string | null;
   ycProfileUrl: string | null;
+  sourceProfileUrl?: string | null;
   batch: string | null;
   isFounder: boolean;
 }
@@ -46,13 +77,20 @@ export interface RunStats {
 }
 
 export interface RawCandidate {
-  source: Exclude<ScraperSource, "yc_directory">;
+  source: ScraperSource;
   rawText: string;
   founderName: string | null;
   companyName: string | null;
   companyDescription: string | null;
   website: string | null;
   ycProfileUrl: string | null;
+  sourceProfileUrl?: string | null;
+  fundingSource?: string | null;
+  fundingDate?: string | null;
+  fundingRound?: string | null;
+  techCategory?: string | null;
+  careersUrl?: string | null;
+  engineeringHiringSignal?: boolean;
   twitterHandle: string | null;
   batch: string | null;
 }
@@ -79,11 +117,7 @@ export type RunStatField = Exclude<keyof RunStats, "startedAt">;
 export interface ScrapeOptions {
   maxResults?: number;
   visitedUrls?: Set<string>;
+  dryRun?: boolean;
 }
 
-export interface SourceQuotaMap {
-  yc_directory: number;
-  hn_launch: number;
-  twitter: number;
-  producthunt: number;
-}
+export type SourceQuotaMap = Record<ScraperSource, number>;

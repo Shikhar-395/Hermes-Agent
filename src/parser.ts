@@ -1,8 +1,19 @@
 import OpenAI from "openai";
 
 import { config } from "./config.js";
+import {
+  calculateApiCost,
+  getTotalSpend,
+  logApiUsage,
+  OPENROUTER_DEEPSEEK_MODEL,
+} from "./database.js";
 import { logger } from "./logger.js";
 import type { DeepSeekResponse, RawCandidate } from "./types.js";
+
+interface DeepSeekUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+}
 
 export interface DeepSeekClientLike {
   chat: {
@@ -13,12 +24,23 @@ export interface DeepSeekClientLike {
             content?: string | null;
           };
         }>;
+        usage?: DeepSeekUsage;
       }>;
     };
   };
 }
 
 let deepSeekClient: DeepSeekClientLike | null = null;
+
+export class ApiSpendLimitReachedError extends Error {
+  public constructor(
+    public readonly totalSpend: number,
+    public readonly limit: number,
+  ) {
+    super(`API spend limit reached: $${totalSpend.toFixed(4)}`);
+    this.name = "ApiSpendLimitReachedError";
+  }
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -30,7 +52,7 @@ function getClient(): DeepSeekClientLike {
   if (!deepSeekClient) {
     deepSeekClient = new OpenAI({
       apiKey: config.DEEPSEEK_API_KEY,
-      baseURL: "https://api.deepseek.com",
+      baseURL: "https://openrouter.ai/api/v1",
     }) as unknown as DeepSeekClientLike;
   }
 
@@ -67,6 +89,43 @@ function buildUserPrompt(rawText: string): string {
   ].join("\n");
 }
 
+function trackApiUsage(usage: DeepSeekUsage | undefined): void {
+  const promptTokens = usage?.prompt_tokens ?? 0;
+  const completionTokens = usage?.completion_tokens ?? 0;
+  const callCost = calculateApiCost(promptTokens, completionTokens);
+
+  logApiUsage(promptTokens, completionTokens);
+
+  const totalSpend = getTotalSpend();
+  console.log(
+    `💰 This call: $${callCost.toFixed(6)} | Total spent: $${totalSpend.toFixed(4)} / $${config.MAX_API_SPEND_USD.toFixed(2)}`,
+  );
+
+  if (totalSpend >= config.MAX_API_SPEND_USD) {
+    console.log("🛑 Spend limit reached — shutting down");
+    throw new ApiSpendLimitReachedError(totalSpend, config.MAX_API_SPEND_USD);
+  }
+}
+
+export async function testDeepSeekApi(options?: {
+  client?: DeepSeekClientLike;
+}): Promise<void> {
+  const client = options?.client ?? getClient();
+  const response = await client.chat.completions.create({
+    model: OPENROUTER_DEEPSEEK_MODEL,
+    temperature: 0,
+    max_tokens: 1,
+    messages: [
+      {
+        role: "user",
+        content: "Reply OK.",
+      },
+    ],
+  });
+
+  trackApiUsage(response.usage);
+}
+
 export async function parseFounderData(
   rawText: string,
   options?: {
@@ -78,9 +137,13 @@ export async function parseFounderData(
   const sleepFn = options?.sleepFn ?? sleep;
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
+    let response: Awaited<
+      ReturnType<DeepSeekClientLike["chat"]["completions"]["create"]>
+    >;
+
     try {
-      const response = await client.chat.completions.create({
-        model: "deepseek-chat",
+      response = await client.chat.completions.create({
+        model: OPENROUTER_DEEPSEEK_MODEL,
         temperature: 0.1,
         max_tokens: 1000,
         messages: [
@@ -95,15 +158,6 @@ export async function parseFounderData(
           },
         ],
       });
-
-      const content = response.choices?.[0]?.message?.content ?? "";
-      const parsed = extractJsonObjectFromResponse(content);
-
-      if (!parsed) {
-        logger.warn("DeepSeek returned non-JSON or invalid JSON output");
-      }
-
-      return parsed;
     } catch (error) {
       logger.error(
         `DeepSeek parsing failed on attempt ${attempt}: ${
@@ -118,6 +172,24 @@ export async function parseFounderData(
 
       return null;
     }
+
+    trackApiUsage(response.usage);
+
+    const content = response.choices?.[0]?.message?.content ?? "";
+    const parsed = extractJsonObjectFromResponse(content);
+
+    if (parsed) {
+      return parsed;
+    }
+
+    if (attempt === 1) {
+      logger.warn("DeepSeek returned non-JSON or invalid JSON output; retrying");
+      await sleepFn(1000);
+      continue;
+    }
+
+    logger.warn("DeepSeek returned non-JSON or invalid JSON output after retry");
+    return null;
   }
 
   return null;

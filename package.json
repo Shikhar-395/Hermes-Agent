@@ -1,6 +1,7 @@
 {
   "name": "hermes-agent",
   "version": "1.0.0",
+  "description": "Autonomous TypeScript agent for discovering recently funded startup founders, enriching their public profiles, and sending structured Telegram updates.",
   "private": true,
   "type": "module",
   "engines": {
@@ -33,6 +34,8 @@
     "start": "tsx src/main.ts",
     "dev": "tsx watch src/main.ts",
     "test": "node --import tsx --test test/**/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check": "npx sqlite3 data/hermes.db 'SELECT founder_name, company_name, funding_source, tech_category, linkedin_url, twitter_url, careers_url, engineering_hiring_signal, sent_at FROM founders ORDER BY created_at DESC LIMIT 10;'",
+    "spend": "npx sqlite3 data/hermes.db 'SELECT ROUND(SUM(cost_usd), 6) as total_spent FROM api_usage;'"
   }
 }
